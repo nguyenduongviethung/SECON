@@ -39,7 +39,6 @@ import torch.nn.functional as F
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 from scipy.sparse import csr_matrix
 import statistics
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,3' 
 
 logger = logging.getLogger(__name__)
 def covariance_loss(z1: torch.Tensor) -> torch.Tensor:
