@@ -18,11 +18,9 @@ Fine-tuning the library models for language modeling on a text file (GPT, GPT-2,
 GPT and GPT-2 are fine-tuned using a causal language modeling (CLM) loss while BERT and RoBERTa are fine-tuned
 using a masked language modeling (MLM) loss.
 """
-import sys 
 import argparse
 import logging
 import os
-import pickle
 import random
 import torch
 import json
@@ -30,29 +28,14 @@ import numpy as np
 
 from model import Model,CoModel
 
-from torch.nn import CrossEntropyLoss, MSELoss
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
-from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-                              RobertaConfig, RobertaModel, RobertaTokenizer)
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
+from transformers import (get_linear_schedule_with_warmup, RobertaModel, RobertaTokenizer)
+from torch.optim import AdamW
 
-import torch.distributed as dist
-import contextlib
 import torch.nn as nn
 import math
-from copy import deepcopy
 
-from torch.autograd import grad
 import torch.nn.functional as F
-from torch.autograd.function import InplaceFunction
-import torch.nn.init as init
-from torch.nn import Parameter
-from torch.optim import Optimizer
-import copy
-
-from typing import Optional
-from collections import OrderedDict
-from torch.nn.modules.module import Module
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 from scipy.sparse import csr_matrix
 import statistics
@@ -96,50 +79,46 @@ def compute_kl_loss(p, q, pad_mask=None):
 
 
 def polyloss(view1, view2, margin):
-    
-    sim_mat = sim_matrix(view1,view2)
-    epsilon = 1e-5
-    size=sim_mat.size(0)
-    hh=sim_mat.t()
-    label=torch.Tensor([i for i in range(size)])
-  
-    loss = list()
-    for i in range(size):
-        pos_pair_ = sim_mat[i][i]
-        pos_pair_ = pos_pair_[pos_pair_ < 1 - epsilon]
-        neg_pair_ = sim_mat[i][label!=label[i]]
 
-        neg_pair = neg_pair_[neg_pair_ + margin > min(pos_pair_)]
+    sim = sim_matrix(view1, view2)
+    size = sim.size(0)
 
-        pos_pair=pos_pair_
-        if len(neg_pair) < 1 or len(pos_pair) < 1:
-            continue
+    # positive pairs
+    pos = sim.diag()
 
-        pos_loss =torch.clamp(0.2*torch.pow(pos_pair,2)-0.7*pos_pair+0.5, min=0)
-        neg_pair=max(neg_pair)
-        neg_loss = torch.clamp(0.9*torch.pow(neg_pair,2)-0.4*neg_pair+0.03,min=0)
+    # mask diagonal
+    eye = torch.eye(size, dtype=torch.bool, device=sim.device)
 
-        loss.append(pos_loss + neg_loss)
-    for i in range(size):
-        pos_pair_ = hh[i][i]
-        pos_pair_ = pos_pair_[pos_pair_ < 1 - epsilon]
-        neg_pair_ = hh[i][label!=label[i]]
+    neg = sim.masked_fill(eye, -1e9)
 
-        neg_pair = neg_pair_[neg_pair_ + margin > min(pos_pair_)]
+    # hard negative mining
+    hard_mask = neg + margin > pos.unsqueeze(1)
 
-        pos_pair=pos_pair_
-        if len(neg_pair) < 1 or len(pos_pair) < 1:
-            continue
-        pos_loss =torch.clamp(0.2*torch.pow(pos_pair,2)-0.7*pos_pair+0.5,min=0)
+    hard_neg = neg.masked_fill(~hard_mask, -1e9)
 
-        neg_pair=max(neg_pair)
-        neg_loss = torch.clamp(0.9*torch.pow(neg_pair,2)-0.4*neg_pair+0.03,min=0)
-        loss.append(pos_loss + neg_loss)
-        
-    if len(loss) == 0:
+    hardest_neg, _ = hard_neg.max(dim=1)
+
+    # valid samples
+    valid = (pos < 1 - 1e-5) & (hardest_neg > -1e8)
+
+    pos = pos[valid]
+    hardest_neg = hardest_neg[valid]
+
+    if len(pos) == 0:
         return torch.zeros([], requires_grad=True)
 
-    loss = sum(loss) / size
+    pos_loss = torch.clamp(
+        0.2 * pos.pow(2) - 0.7 * pos + 0.5,
+        min=0
+    )
+
+    neg_loss = torch.clamp(
+        0.9 * hardest_neg.pow(2) - 0.4 * hardest_neg + 0.03,
+        min=0
+    )
+
+    loss = (pos_loss + neg_loss)
+
     return loss
 
     
@@ -240,63 +219,14 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-    
 
 
 def loss_fn(nl_vec,code_vec):
 
-    poly_loss = polyloss(nl_vec,code_vec,0.15)
+    loss1 = polyloss(nl_vec,code_vec,0.15)
+    loss2 = polyloss(code_vec,nl_vec,0.15)
 
-    return poly_loss
-
-class NormSoftmaxLoss(nn.Module):
-    #https://github.com/TencentARC/MCQ/blob/3555a9bbebca0919eebfe1c4b398c3686057ef77/MILES/model/loss.py
-    def __init__(self, temperature=0.05):
-        super().__init__()
-
-        self.temperature = temperature
-
-    def forward(self, view1, view2):
-        x = sim_matrix(view1, view2)
-
-        "Assumes input x is similarity matrix of N x M \in [-1, 1], computed using the cosine similarity between normalised vectors"
-        #print(x.shape)
-        i_logsm = F.log_softmax(x/self.temperature, dim=1)
-        j_logsm = F.log_softmax(x.t()/self.temperature, dim=1)
-
-        # sum over positives
-        idiag = torch.diag(i_logsm)
-        loss_i = idiag.sum() / len(idiag)
-
-        jdiag = torch.diag(j_logsm)
-        loss_j = jdiag.sum() / len(jdiag)
-
-        return - loss_i - loss_j
-    
-class FGM():
-    def __init__(self, model):
-        self.model = model
-        self.backup = {}
-
-    def attack(self, epsilon=1., emb_names=["word_embeddings"]):
-        # emb_name这个参数要换成你模型中embedding的参数名
-        for emb_name in emb_names:
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and emb_name in name:
-                    self.backup[name] = param.data.clone()
-                    norm = torch.norm(param.grad)
-                    if norm != 0 and not torch.isnan(norm):
-                        r_at = epsilon * param.grad / norm
-                        param.data.add_(r_at)
-
-    def restore(self, emb_names=["word_embeddings"]):
-        # emb_name这个参数要换成你模型中embedding的参数名#
-        for emb_name in emb_names:
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and emb_name in name: 
-                    assert name in self.backup
-                    param.data = self.backup[name]
-            self.backup = {}
+    return (loss1.sum() + loss2.sum())/nl_vec.size(0)
                         
             
 def compute_gce(z1_outs, z2_outs, quantile):
@@ -337,7 +267,7 @@ def train(args, model, cmodel, tokenizer):
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0, num_training_steps = len(train_dataloader) * args.num_train_epochs)
 
-    coptimizer = AdamW(cmodel.parameters(), lr=args.learning_rate, eps=1e-8)
+    coptimizer = AdamW(filter(lambda p: p.requires_grad, cmodel.parameters()), lr=args.learning_rate, eps=1e-8)
     cscheduler = get_linear_schedule_with_warmup(coptimizer, num_warmup_steps = 0, num_training_steps = len(train_dataloader) * args.num_train_epochs)
 
     # Train!
@@ -359,7 +289,16 @@ def train(args, model, cmodel, tokenizer):
 
     #print(model.module.gpool)
     #print(model.module.encoder.encoder.layer[11])
-    tr_num,tr_loss,best_mrr = 0,0,0 
+    tr_num,tr_loss,best_mrr = 0,0,0
+
+    checkpoint_prefix = 'checkpoint-best-mrr'
+    output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)                        
+    model_to_save = model.module if hasattr(model,'module') else model
+    output_dir = os.path.join(output_dir, '{}'.format('model.bin')) 
+    torch.save(model_to_save.state_dict(), output_dir)
+    logger.info("Saving model checkpoint to %s", output_dir)
 
     for idx in range(args.num_train_epochs): 
         '''
@@ -533,11 +472,13 @@ def main():
     
     parser.add_argument("--model_name_or_path", default=None, type=str,
                         help="The model checkpoint for weights initialization.")
-    parser.add_argument("--config_name", default="", type=str,
-                        help="Optional pretrained config name or path if not the same as model_name_or_path")
-    parser.add_argument("--tokenizer_name", default="", type=str,
-                        help="Optional pretrained tokenizer name or path if not the same as model_name_or_path")
-    
+    parser.add_argument("--poly_m", default=16, type=int,
+                        help="The number of learnable polynomial codes.")
+    parser.add_argument("--poly_code_dim", default=768, type=int,
+                        help="The dimension of learnable polynomial codes.")
+    parser.add_argument("--frozen_layers", default=None, type=str,
+                        help="The layers to freeze during training.")
+
     parser.add_argument("--nl_length", default=128, type=int,
                         help="Optional NL input sequence length after tokenization.")    
     parser.add_argument("--code_length", default=256, type=int,
@@ -582,6 +523,8 @@ def main():
     # Set seed
     set_seed(args.seed)
 
+    args.frozen_layers = args.frozen_layers.split(",") if args.frozen_layers is not None else []
+
     #build model
     tokenizer = RobertaTokenizer.from_pretrained(args.model_name_or_path)#(args.model_name_or_path)
     #config = RobertaConfig.from_pretrained(args.model_name_or_path)  ("DeepSoftwareAnalytics/CoCoSoDa")#
@@ -605,7 +548,6 @@ def main():
         train(args, model, cmodel, tokenizer)
 
     # Evaluation
-    results = {}
     if args.do_eval:
         if args.do_zero_shot is False:
             checkpoint_prefix = 'checkpoint-best-mrr/model.bin'

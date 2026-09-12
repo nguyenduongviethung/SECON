@@ -35,18 +35,15 @@ class CoModel(nn.Module):
         super(CoModel, self).__init__()
         self.encoder = encoder
         self.args = args
-        '''
-        unfreeze_layers = ['layer.10','layer.11']# 'layer.8','layer.9','layer.10','layer.11'
-        
+
         for name ,param in self.encoder.named_parameters():
-            param.requires_grad = False
-            for ele in unfreeze_layers:
+            for ele in args.frozen_layers:
                 if ele in name:
-                    param.requires_grad = True
-                    break      
-        '''
-        self.poly_m = 8
-        self.poly_code_embeddings = nn.Embedding(self.poly_m, 768).to(self.args.device)  
+                    param.requires_grad = False
+                    break
+
+        self.poly_m = args.poly_m
+        self.poly_code_embeddings = nn.Embedding(self.poly_m, args.poly_code_dim).to(self.args.device)  
         # https://github.com/facebookresearch/ParlAI/blob/master/parlai/agents/transformer/polyencoder.py#L355
         #torch.nn.init.normal_(self.poly_code_embeddings.weight, 768 ** -0.5)
 
@@ -60,54 +57,52 @@ class CoModel(nn.Module):
         output = torch.matmul(attn_weights, v) # [bs, poly_m, dim]
         return output
     
-    def cross_encoder(self, code_inputs=None, nl_inputs=None):
-        # context encoder
-        ctx_out = self.encoder(code_inputs,attention_mask=code_inputs.ne(1))[0]  # [bs, length, dim]
-        #print("ctx_out",ctx_out.shape)
+    def encode(self, code_inputs=None, nl_inputs=None):
+        code_hidden, nl_hidden = None, None
 
-        poly_code_ids = torch.arange(self.poly_m, dtype=torch.long).to(self.args.device) 
-        poly_code_ids = poly_code_ids.unsqueeze(0).expand(ctx_out.shape[0], self.poly_m).to(self.args.device) 
+        if code_inputs is not None:
+            code_hidden = self.encoder(
+                code_inputs,
+                attention_mask=code_inputs.ne(1)
+            )[0]
 
-        poly_codes = self.poly_code_embeddings(poly_code_ids).to(self.args.device)  # [bs, poly_m, dim]
-        #print("poly_codes",poly_codes.shape)
-        embs = self.dot_attention(poly_codes, ctx_out, ctx_out).to(self.args.device)  # [bs, poly_m, dim]
+        if nl_inputs is not None:
+            nl_hidden = self.encoder(
+                nl_inputs,
+                attention_mask=nl_inputs.ne(1)
+            )[0]
 
-        # response encoder
-        cand_emb = self.encoder(nl_inputs,attention_mask=nl_inputs.ne(1))[0][:,0,:] # [bs, dim]
-        cand_emb = cand_emb.reshape(cand_emb.shape[0], 1, -1).to(self.args.device)  # [bs, res_cnt, dim]
+        return code_hidden, nl_hidden
 
-        ctx_emb = self.dot_attention(cand_emb, embs, embs).to(self.args.device)  # [bs, res_cnt, dim]
+    def cross(self, ctx_out, cand_out):
+        bs = ctx_out.size(0)
 
+        poly_code_ids = torch.arange(self.poly_m, device=self.args.device)
+        poly_code_ids = poly_code_ids.unsqueeze(0).expand(bs, self.poly_m)
 
-        return cand_emb[:,0,:] 
-    
-    def forward(self, code_inputs=None, nl_inputs=None): 
-        v1 = self.cross_encoder(code_inputs=code_inputs, nl_inputs=nl_inputs)
-        v2 = self.cross_encoder(code_inputs=nl_inputs, nl_inputs=code_inputs)
+        poly_codes = self.poly_code_embeddings(poly_code_ids)
 
-        
+        # poly attention over context
+        embs = self.dot_attention(poly_codes, ctx_out, ctx_out)
+
+        # candidate uses CLS
+        cand_emb = cand_out[:, 0, :].unsqueeze(1)
+
+        ctx_emb = self.dot_attention(cand_emb, embs, embs)
+
+        return ctx_emb[:, 0, :]
+
+    def forward(self, code_inputs=None, nl_inputs=None):
+
+        # ===== encode ONCE ONLY =====
+        code_hidden, nl_hidden = self.encode(code_inputs, nl_inputs)
+
+        v1, v2 = None, None
+
+        # code -> nl
+        if code_hidden is not None and nl_hidden is not None:
+            v1 = self.cross(code_hidden, nl_hidden)
+            v2 = self.cross(nl_hidden, code_hidden)
+
         return v1, v2
-'''              
-class CoModel(nn.Module):   
-    def __init__(self, encoder,args):
-        super(CoModel, self).__init__()
-        self.encoder = encoder
-        
-        unfreeze_layers = ['layer.9','layer.10','layer.11']# 'layer.8','layer.9','layer.10','layer.11'
-        
-        for name ,param in self.encoder.named_parameters():
-            param.requires_grad = False
-            for ele in unfreeze_layers:
-                if ele in name:
-                    param.requires_grad = True
-                    break    
-        
-    def forward(self, code_inputs=None, nl_inputs=None): 
-                
-    
-        output1 = self.encoder(code_inputs,attention_mask=code_inputs.ne(1))[0][:,0,:]
-        
-        output2 = self.encoder(nl_inputs,attention_mask=nl_inputs.ne(1))[0][:,0,:]
-        return output1,output2
-'''
     
