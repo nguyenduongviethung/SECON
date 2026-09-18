@@ -263,7 +263,7 @@ def train(args, model, cmodel, tokenizer):
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,num_workers=4)
 
     #get optimizer and scheduler
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, eps=1e-8)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = 0, num_training_steps = len(train_dataloader) * args.num_train_epochs)
 
     coptimizer = AdamW(filter(lambda p: p.requires_grad, cmodel.parameters()), lr=args.learning_rate, eps=1e-8)
@@ -533,7 +533,7 @@ def main():
     model = RobertaModel.from_pretrained(args.model_name_or_path)#(args.model_name_or_path) 
     model2 = RobertaModel.from_pretrained(args.model_name_or_path)#(args.model_name_or_path) 
 
-    model = Model(model)
+    model = Model(model, args)
     cmodel = CoModel(model2, args)
 
     

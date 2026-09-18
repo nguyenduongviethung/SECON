@@ -11,9 +11,15 @@ import torch
 import torch.nn.functional as F
 
 class Model(nn.Module):   
-    def __init__(self, encoder):
+    def __init__(self, encoder, args):
         super(Model, self).__init__()
         self.encoder = encoder
+
+        for name ,param in self.encoder.named_parameters():
+            for ele in args.frozen_layers:
+                if ele in name:
+                    param.requires_grad = False
+                    break
 
     def forward(self, code_inputs=None, nl_inputs=None): 
                 
@@ -31,16 +37,13 @@ class Model(nn.Module):
 
         
 class CoModel(nn.Module):   
-    def __init__(self, encoder,args):
+    def __init__(self, encoder, args):
         super(CoModel, self).__init__()
         self.encoder = encoder
         self.args = args
 
-        for name ,param in self.encoder.named_parameters():
-            for ele in args.frozen_layers:
-                if ele in name:
-                    param.requires_grad = False
-                    break
+        for param in self.encoder.parameters():
+            param.requires_grad = False
 
         self.poly_m = args.poly_m
         self.poly_code_embeddings = nn.Embedding(self.poly_m, args.poly_code_dim).to(self.args.device)  
