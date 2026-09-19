@@ -356,9 +356,11 @@ def train(args, model, cmodel, tokenizer):
             torch.nn.utils.clip_grad_norm_(cmodel.parameters(), args.max_grad_norm)
             coptimizer.step()
             coptimizer.zero_grad()
-            cscheduler.step() 
+            cscheduler.step()
 
-
+            with torch.no_grad():
+                for p_model, p_cmodel in zip(model.parameters(), cmodel.parameters()):
+                    p_cmodel.data = p_cmodel.data * args.moco_m + p_model.data * (1 - args.moco_m)
 
         #evaluate    
         results = evaluate(args, model, tokenizer,args.eval_data_file, eval_when_training=True)
@@ -477,6 +479,8 @@ def main():
                         help="The dimension of learnable polynomial codes.")
     parser.add_argument("--frozen_layers", default=None, type=str,
                         help="The layers to freeze during training.")
+    parser.add_argument('--moco_m', default=0.999, type=float,
+                        help='moco momentum of updating key encoder (default: 0.999)')
 
     parser.add_argument("--nl_length", default=128, type=int,
                         help="Optional NL input sequence length after tokenization.")    
