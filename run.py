@@ -134,14 +134,15 @@ def sim_matrix(a, b, eps=1e-8):
     return sim_mt  
 
 class InputFeatures(object):
-    """A single training/test features for a example."""
-    def __init__(self,
-                 code_tokens,
-                 code_ids,
-                 nl_tokens,
-                 nl_ids,
-                 url,
-
+    def __init__(
+        self,
+        code_tokens,
+        code_ids,
+        nl_tokens,
+        nl_ids,
+        url,
+        generated_code_ids=None,
+        generated_nl_ids=None,
     ):
         self.code_tokens = code_tokens
         self.code_ids = code_ids
@@ -149,27 +150,97 @@ class InputFeatures(object):
         self.nl_ids = nl_ids
         self.url = url
 
+        self.generated_code_ids = generated_code_ids
+        self.generated_nl_ids = generated_nl_ids
+
+def encode_text(text, tokenizer, max_length):
+    tokens = tokenizer.tokenize(text)[:max_length - 4]
+
+    tokens = [
+        tokenizer.cls_token,
+        "<encoder-only>",
+        tokenizer.sep_token
+    ] + tokens + [tokenizer.sep_token]
+
+    ids = tokenizer.convert_tokens_to_ids(tokens)
+
+    padding_length = max_length - len(ids)
+    ids += [tokenizer.pad_token_id] * padding_length
+
+    return tokens, ids
         
-def convert_examples_to_features(js,tokenizer,args):
-    """convert examples to token ids"""
-    code = ' '.join(js['code_tokens']) if type(js['code_tokens']) is list else ' '.join(js['code_tokens'].split())
-    code_tokens = tokenizer.tokenize(code)[:args.code_length-4]
-    code_tokens =[tokenizer.cls_token,"<encoder-only>",tokenizer.sep_token]+code_tokens+[tokenizer.sep_token]
-    code_ids = tokenizer.convert_tokens_to_ids(code_tokens)
-    padding_length = args.code_length - len(code_ids)
-    code_ids += [tokenizer.pad_token_id]*padding_length
-    
-    nl = ' '.join(js['docstring_tokens']) if type(js['docstring_tokens']) is list else ' '.join(js['doc'].split())
-    nl_tokens = tokenizer.tokenize(nl)[:args.nl_length-4]
-    nl_tokens = [tokenizer.cls_token,"<encoder-only>",tokenizer.sep_token]+nl_tokens+[tokenizer.sep_token]
-    nl_ids = tokenizer.convert_tokens_to_ids(nl_tokens)
-    padding_length = args.nl_length - len(nl_ids)
-    nl_ids += [tokenizer.pad_token_id]*padding_length    
-    
-    return InputFeatures(code_tokens,code_ids,nl_tokens,nl_ids,js['url'] if "url" in js else js["retrieval_idx"])
+def convert_examples_to_features(js, tokenizer, args, use_generated=False):
+
+    # =========================
+    # Original code
+    # =========================
+
+    code = (
+        " ".join(js["code_tokens"])
+        if isinstance(js["code_tokens"], list)
+        else " ".join(js["code_tokens"].split())
+    )
+
+    code_tokens, code_ids = encode_text(
+        code,
+        tokenizer,
+        args.code_length
+    )
+
+    # =========================
+    # Original query
+    # =========================
+
+    nl = (
+        " ".join(js["docstring_tokens"])
+        if isinstance(js["docstring_tokens"], list)
+        else " ".join(js["doc"].split())
+    )
+
+    nl_tokens, nl_ids = encode_text(
+        nl,
+        tokenizer,
+        args.nl_length
+    )
+
+    # =========================
+    # Generated augmentation
+    # =========================
+
+    generated_code_ids = None
+    generated_nl_ids = None
+
+    if use_generated:
+
+        generated_code = js["generated_code"]
+        generated_query = js["generated_query"]
+
+        _, generated_code_ids = encode_text(
+            generated_code,
+            tokenizer,
+            args.code_length
+        )
+
+        _, generated_nl_ids = encode_text(
+            generated_query,
+            tokenizer,
+            args.nl_length
+        )
+
+    return InputFeatures(
+        code_tokens,
+        code_ids,
+        nl_tokens,
+        nl_ids,
+        js["url"] if "url" in js else js["retrieval_idx"],
+        generated_code_ids,
+        generated_nl_ids
+    )
 
 class TextDataset(Dataset):
-    def __init__(self, tokenizer, args, file_path=None):
+    def __init__(self, tokenizer, args, file_path, use_generated=False):
+        self.args = args
+        self.use_generated = use_generated
         self.examples = []
         data = []
         with open(file_path) as f:
@@ -194,7 +265,7 @@ class TextDataset(Dataset):
                     data.append(js) 
 
         for js in data:
-            self.examples.append(convert_examples_to_features(js,tokenizer,args))
+            self.examples.append(convert_examples_to_features(js, tokenizer, args, use_generated))
                 
         if "train" in file_path:
             for idx, example in enumerate(self.examples[:3]):
@@ -208,8 +279,21 @@ class TextDataset(Dataset):
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, i):   
-        return (torch.tensor(self.examples[i].code_ids),torch.tensor(self.examples[i].nl_ids))
+    def __getitem__(self, i):
+        example = self.examples[i]
+
+        if self.use_generated:
+            return (
+                torch.tensor(example.code_ids),
+                torch.tensor(example.nl_ids),
+                torch.tensor(example.generated_code_ids),
+                torch.tensor(example.generated_nl_ids),
+            )
+
+        return (
+            torch.tensor(example.code_ids),
+            torch.tensor(example.nl_ids)
+        )
             
 def set_seed(seed=42):
     random.seed(seed)
@@ -258,7 +342,17 @@ def compute_gce(z1_outs, z2_outs, quantile):
 def train(args, model, cmodel, tokenizer):
     """ Train the model """
     #get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file)
+    train_file = args.train_data_file
+
+    if args.use_generated:
+        train_file = args.generated_train_data_file
+
+    train_dataset = TextDataset(
+        tokenizer,
+        args,
+        train_file,
+        use_generated=args.use_generated
+    )
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,num_workers=4)
 
@@ -322,19 +416,39 @@ def train(args, model, cmodel, tokenizer):
 
         model.train()
         '''
-        for step,batch in enumerate(train_dataloader):
-            #get inputs
-            code_inputs = batch[0].to(args.device)    
+        for step, batch in enumerate(train_dataloader):
+            # Original view
+            code_inputs = batch[0].to(args.device)
             nl_inputs = batch[1].to(args.device)
-   
-            #get code and nl vectors
-            
+
+            # Original encoder
             code_vec = model(code_inputs=code_inputs)
             nl_vec = model(nl_inputs=nl_inputs)
 
-            vec1,vec2 = cmodel(code_inputs=code_inputs,nl_inputs=nl_inputs)
+            if args.use_generated:
 
-            loss =  loss_fn(code_vec,nl_vec) + loss_fn(nl_vec,vec1) + loss_fn(vec2,code_vec) + covariance_loss(code_vec)
+                generated_code_inputs = batch[2].to(args.device)
+                generated_nl_inputs = batch[3].to(args.device)
+
+                # Augmented / momentum encoder
+                vec1, vec2 = cmodel(
+                    code_inputs=generated_code_inputs,
+                    nl_inputs=generated_nl_inputs
+                )
+
+            else:
+
+                vec1, vec2 = cmodel(
+                    code_inputs=code_inputs,
+                    nl_inputs=nl_inputs
+                )
+
+            loss = (
+                loss_fn(code_vec, nl_vec)
+                + loss_fn(nl_vec, vec1)
+                + loss_fn(vec2, code_vec)
+                + covariance_loss(code_vec)
+            )
 
             
             #report loss
@@ -470,6 +584,29 @@ def main():
                         help="An optional input test data file to test the MRR(a josnl file).")
     parser.add_argument("--codebase_file", default=None, type=str,
                         help="An optional input test data file to codebase (a jsonl file).")  
+
+    parser.add_argument(
+        "--generated_train_data_file",
+        default=None,
+        type=str
+    )
+
+    parser.add_argument(
+        "--generated_eval_data_file",
+        default=None,
+        type=str
+    )
+
+    parser.add_argument(
+        "--generated_codebase_file",
+        default=None,
+        type=str
+    )
+
+    parser.add_argument(
+        "--use_generated",
+        action="store_true"
+    )
     
     parser.add_argument("--model_name_or_path", default=None, type=str,
                         help="The model checkpoint for weights initialization.")
