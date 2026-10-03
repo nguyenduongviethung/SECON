@@ -106,6 +106,39 @@ def info_nce_loss(nl_vec, code_vec, temperature=0.05):
 
     return loss
 
+def augmentation_alignment_loss(
+    nl_vec,
+    code_vec,
+    generated_nl_vec,
+    generated_code_vec,
+    temperature=0.05
+):
+    """
+    Align original and generated representations.
+
+    Query alignment:
+        query[i] <-> generated_query[i]
+
+    Code alignment:
+        code[i] <-> generated_code[i]
+    """
+
+    query_loss = info_nce_loss(
+        nl_vec,
+        generated_nl_vec,
+        temperature=temperature
+    )
+
+    code_loss = info_nce_loss(
+        code_vec,
+        generated_code_vec,
+        temperature=temperature
+    )
+
+    return query_loss + code_loss
+
+
+
 class InputFeatures(object):
     def __init__(
         self,
@@ -402,6 +435,148 @@ def train(args, model, tokenizer):
         output_dir
     )
 
+    # ==============================================================
+    # Stage 0: Align original and generated representations
+    #
+    # query <-> generated_query
+    # code  <-> generated_code
+    #
+    # This stage is performed before the main query-code training.
+    # ==============================================================
+
+    if args.use_generated and args.num_alignment_epochs > 0:
+
+        logger.info("***** Running generated representation alignment *****")
+        logger.info(
+            "  Num alignment epochs = %d",
+            args.num_alignment_epochs
+        )
+
+        alignment_optimizer = AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.learning_rate,
+            eps=1e-8
+        )
+
+        alignment_scheduler = get_linear_schedule_with_warmup(
+            alignment_optimizer,
+            num_warmup_steps=0,
+            num_training_steps=(
+                len(train_dataloader) *
+                args.num_alignment_epochs
+            )
+        )
+
+        model.train()
+
+        for alignment_epoch in range(
+            args.num_alignment_epochs
+        ):
+
+            alignment_loss_sum = 0.0
+
+            for step, batch in enumerate(train_dataloader):
+
+                code_inputs = batch[0].to(args.device)
+                nl_inputs = batch[1].to(args.device)
+
+                generated_code_inputs = batch[2].to(args.device)
+                generated_nl_inputs = batch[3].to(args.device)
+
+                # --------------------------------------------------
+                # Encode original and generated query/code
+                # --------------------------------------------------
+
+                code_vec = model(
+                    code_inputs=code_inputs
+                )
+
+                nl_vec = model(
+                    nl_inputs=nl_inputs
+                )
+
+                generated_code_vec = model(
+                    code_inputs=generated_code_inputs
+                )
+
+                generated_nl_vec = model(
+                    nl_inputs=generated_nl_inputs
+                )
+
+                # --------------------------------------------------
+                # Alignment loss
+                #
+                # query <-> generated query
+                # code  <-> generated code
+                # --------------------------------------------------
+
+                alignment_loss = augmentation_alignment_loss(
+                    nl_vec,
+                    code_vec,
+                    generated_nl_vec,
+                    generated_code_vec,
+                    temperature=args.temperature
+                )
+
+                alignment_loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.max_grad_norm
+                )
+
+                alignment_optimizer.step()
+                alignment_optimizer.zero_grad()
+                alignment_scheduler.step()
+
+                alignment_loss_sum += alignment_loss.item()
+
+            logger.info(
+                "alignment epoch {} loss {}".format(
+                    alignment_epoch,
+                    round(
+                        alignment_loss_sum / len(train_dataloader),
+                        5
+                    )
+                )
+            )
+
+            # evaluate
+            results = evaluate(
+                args,
+                model,
+                tokenizer,
+                args.eval_data_file,
+                eval_when_training=True
+            )
+    
+            for key, value in results.items():
+                logger.info(
+                    "  %s = %s",
+                    key,
+                    round(value, 4)
+                )
+
+        logger.info(
+            "***** Finished generated representation alignment *****"
+        )
+
+    # ==============================================================
+    # Main training optimizer
+    # ==============================================================
+
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.learning_rate,
+        eps=1e-8
+    )
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=len(train_dataloader) * args.num_train_epochs
+    )
+
     for idx in range(args.num_train_epochs):
 
         for step, batch in enumerate(train_dataloader):
@@ -422,7 +597,10 @@ def train(args, model, tokenizer):
             code_inputs = batch[0].to(args.device)
             nl_inputs = batch[1].to(args.device)
 
-            # Encode code and NL with the same trainable model
+                        # ==========================================================
+            # Original query/code
+            # ==========================================================
+
             code_vec = model(
                 code_inputs=code_inputs
             )
@@ -431,12 +609,46 @@ def train(args, model, tokenizer):
                 nl_inputs=nl_inputs
             )
 
-            # Symmetric InfoNCE with in-batch negatives
+            # Original query <-> original code
             loss = info_nce_loss(
                 nl_vec,
                 code_vec,
                 temperature=args.temperature
             )
+
+            # ==========================================================
+            # Generated augmentation
+            #
+            # query          <-> generated code
+            # generated query <-> code
+            # ==========================================================
+
+            if args.use_generated:
+
+                generated_code_inputs = batch[2].to(args.device)
+                generated_nl_inputs = batch[3].to(args.device)
+
+                generated_code_vec = model(
+                    code_inputs=generated_code_inputs
+                )
+
+                generated_nl_vec = model(
+                    nl_inputs=generated_nl_inputs
+                )
+
+                # query <-> generated code
+                loss += info_nce_loss(
+                    nl_vec,
+                    generated_code_vec,
+                    temperature=args.temperature
+                )
+
+                # generated query <-> code
+                loss += info_nce_loss(
+                    generated_nl_vec,
+                    code_vec,
+                    temperature=args.temperature
+                )
 
             # report loss
             tr_loss += loss.item()
@@ -715,18 +927,6 @@ def main():
     )
 
     parser.add_argument(
-        "--generated_eval_data_file",
-        default=None,
-        type=str
-    )
-
-    parser.add_argument(
-        "--generated_codebase_file",
-        default=None,
-        type=str
-    )
-
-    parser.add_argument(
         "--use_generated",
         action="store_true"
     )
@@ -829,6 +1029,14 @@ def main():
         default=1,
         type=int,
         help="Total number of training epochs to perform."
+    )
+
+    parser.add_argument(
+        "--num_alignment_epochs",
+        default=0,
+        type=int,
+        help="Number of epochs for aligning original and generated "
+            "query/code representations before main training."
     )
 
     parser.add_argument(

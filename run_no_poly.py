@@ -192,6 +192,34 @@ def loss_fn(nl_vec, code_vec):
     loss2 = polyloss(code_vec, nl_vec, 0.15)
     return (loss1.sum() + loss2.sum()) / nl_vec.size(0)
 
+def augmentation_alignment_loss(
+    nl_vec,
+    code_vec,
+    generated_nl_vec,
+    generated_code_vec,
+):
+    """
+    Align original and generated representations.
+
+    Query alignment:
+        query[i] <-> generated_query[i]
+
+    Code alignment:
+        code[i] <-> generated_code[i]
+    """
+
+    query_loss = loss_fn(
+        nl_vec,
+        generated_nl_vec
+    )
+
+    code_loss = loss_fn(
+        code_vec,
+        generated_code_vec
+    )
+
+    return query_loss + code_loss
+
 
 # ============================================================
 # Dataset
@@ -471,6 +499,146 @@ def train(args, model, cmodel, tokenizer):
     logger.info(
         "Saving model checkpoint to %s",
         os.path.join(output_dir, "model.bin"),
+    )
+
+    # Stage 0: Align original and generated representations
+    #
+    # query <-> generated_query
+    # code  <-> generated_code
+    #
+    # This stage is performed before the main query-code training.
+    # ==============================================================
+
+    if args.use_generated and args.num_alignment_epochs > 0:
+
+        logger.info("***** Running generated representation alignment *****")
+        logger.info(
+            "  Num alignment epochs = %d",
+            args.num_alignment_epochs
+        )
+
+        alignment_optimizer = AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.learning_rate,
+            eps=1e-8
+        )
+
+        alignment_scheduler = get_linear_schedule_with_warmup(
+            alignment_optimizer,
+            num_warmup_steps=0,
+            num_training_steps=(
+                len(train_dataloader) *
+                args.num_alignment_epochs
+            )
+        )
+
+        model.train()
+
+        for alignment_epoch in range(
+            args.num_alignment_epochs
+        ):
+
+            alignment_loss_sum = 0.0
+
+            for step, batch in enumerate(train_dataloader):
+
+                code_inputs = batch[0].to(args.device)
+                nl_inputs = batch[1].to(args.device)
+
+                generated_code_inputs = batch[2].to(args.device)
+                generated_nl_inputs = batch[3].to(args.device)
+
+                # --------------------------------------------------
+                # Encode original and generated query/code
+                # --------------------------------------------------
+
+                code_vec = model(
+                    code_inputs=code_inputs
+                )
+
+                nl_vec = model(
+                    nl_inputs=nl_inputs
+                )
+
+                generated_code_vec = model(
+                    code_inputs=generated_code_inputs
+                )
+
+                generated_nl_vec = model(
+                    nl_inputs=generated_nl_inputs
+                )
+
+                # --------------------------------------------------
+                # Alignment loss
+                #
+                # query <-> generated query
+                # code  <-> generated code
+                # --------------------------------------------------
+
+                alignment_loss = augmentation_alignment_loss(
+                    nl_vec,
+                    code_vec,
+                    generated_nl_vec,
+                    generated_code_vec,
+                )
+
+                alignment_loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.max_grad_norm
+                )
+
+                alignment_optimizer.step()
+                alignment_optimizer.zero_grad()
+                alignment_scheduler.step()
+
+                alignment_loss_sum += alignment_loss.item()
+
+            logger.info(
+                "alignment epoch {} loss {}".format(
+                    alignment_epoch,
+                    round(
+                        alignment_loss_sum / len(train_dataloader),
+                        5
+                    )
+                )
+            )
+
+            # evaluate
+            results = evaluate(
+                args,
+                model,
+                tokenizer,
+                args.eval_data_file,
+                eval_when_training=True
+            )
+    
+            for key, value in results.items():
+                logger.info(
+                    "  %s = %s",
+                    key,
+                    round(value, 4)
+                )
+
+        logger.info(
+            "***** Finished generated representation alignment *****"
+        )
+
+    # ==============================================================
+    # Main training optimizer
+    # ==============================================================
+
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.learning_rate,
+        eps=1e-8
+    )
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=len(train_dataloader) * args.num_train_epochs
     )
 
     for epoch in range(args.num_train_epochs):
@@ -760,18 +928,6 @@ def main():
     )
 
     parser.add_argument(
-        "--generated_eval_data_file",
-        default=None,
-        type=str,
-    )
-
-    parser.add_argument(
-        "--generated_codebase_file",
-        default=None,
-        type=str,
-    )
-
-    parser.add_argument(
         "--use_generated",
         action="store_true",
         help="Use generated query/code as inputs to the momentum encoder.",
@@ -848,6 +1004,14 @@ def main():
         "--num_train_epochs",
         default=1,
         type=int,
+    )
+
+    parser.add_argument(
+        "--num_alignment_epochs",
+        default=0,
+        type=int,
+        help="Number of epochs for aligning original and generated "
+            "query/code representations before main training."
     )
 
     parser.add_argument(
