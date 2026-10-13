@@ -8,6 +8,7 @@ SECON ablation:
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -362,12 +363,8 @@ def convert_examples_to_features(js, tokenizer, args):
         args.code_length,
     )
 
-    # Original query
-    nl = (
-        " ".join(js["docstring_tokens"])
-        if isinstance(js["docstring_tokens"], list)
-        else " ".join(js["doc"].split())
-    )
+    # Tokenize the complete docstring rather than the pre-split summary tokens.
+    nl = js["docstring"]
 
     nl_tokens, nl_ids = encode_text(
         nl,
@@ -696,6 +693,7 @@ def evaluate(
     tokenizer,
     file_name,
     eval_when_training=False,
+    export_path=None,
 ):
     query_dataset = TextDataset(
         tokenizer,
@@ -785,6 +783,85 @@ def evaluate(
         else:
             ranks.append(0)
 
+    if export_path:
+        rows = []
+        topk = min(args.topk, len(code_dataset))
+
+        for query_index, candidate_indices in enumerate(sort_ids[:, :topk]):
+            query_example = query_dataset.examples[query_index]
+            query_text = tokenizer.convert_tokens_to_string(
+                [
+                    token
+                    for token in query_example.nl_tokens
+                    if token not in {
+                        tokenizer.cls_token,
+                        tokenizer.sep_token,
+                        "<encoder-only>",
+                        tokenizer.pad_token,
+                    }
+                ]
+            ).strip()
+            query_url = nl_urls[query_index]
+
+            for rank, code_idx in enumerate(candidate_indices, start=1):
+                code_idx = int(code_idx)
+                code_example = code_dataset.examples[code_idx]
+                code_text = tokenizer.convert_tokens_to_string(
+                    [
+                        token
+                        for token in code_example.code_tokens
+                        if token not in {
+                            tokenizer.cls_token,
+                            tokenizer.sep_token,
+                            "<encoder-only>",
+                            tokenizer.pad_token,
+                        }
+                    ]
+                ).strip()
+                rows.append(
+                    {
+                        "query_index": query_index,
+                        "query_url": query_url,
+                        "query": query_text,
+                        "codebase_index": code_idx,
+                        "code_url": code_urls[code_idx],
+                        "code": code_text,
+                        "dual_encoder_topk_rank": rank,
+                        "dual_encoder_score": float(scores[query_index, code_idx]),
+                        "is_positive": int(code_urls[code_idx] == query_url),
+                    }
+                )
+
+        os.makedirs(
+            os.path.dirname(os.path.abspath(export_path)),
+            exist_ok=True,
+        )
+        fields = [
+            "query_index",
+            "query_url",
+            "query",
+            "codebase_index",
+            "code_url",
+            "code",
+            "dual_encoder_topk_rank",
+            "dual_encoder_score",
+            "is_positive",
+        ]
+        with open(
+            export_path,
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(
+            "Exported %d query-code pairs to %s",
+            len(rows),
+            export_path,
+        )
+
     return {
         "eval_mrr": float(np.mean(ranks)),
     }
@@ -834,6 +911,13 @@ def main():
         help="Codebase file.",
     )
 
+    parser.add_argument(
+        "--test_results_file",
+        default=None,
+        type=str,
+        help="CSV path for the top-k dual-encoder results.",
+    )
+
     # Model
     parser.add_argument(
         "--model_name_or_path",
@@ -867,6 +951,13 @@ def main():
         "--code_length",
         default=256,
         type=int,
+    )
+
+    parser.add_argument(
+        "--topk",
+        default=100,
+        type=int,
+        help="Number of top-ranked code candidates per query to include in the test CSV.",
     )
 
     # Modes
@@ -943,6 +1034,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.do_test and args.topk <= 0:
+        parser.error("--topk must be greater than 0")
 
     print(json.dumps(vars(args), indent=4))
 
@@ -1053,6 +1147,10 @@ def main():
             model,
             tokenizer,
             args.test_data_file,
+            export_path=args.test_results_file or os.path.join(
+                args.output_dir,
+                "dual_encoder_test_results.csv",
+            ),
         )
 
         logger.info("***** Test results *****")

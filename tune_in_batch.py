@@ -160,11 +160,7 @@ def convert_examples_to_features(js, tokenizer, args):
     # Original query
     # =========================
 
-    nl = (
-        " ".join(js["docstring_tokens"])
-        if isinstance(js["docstring_tokens"], list)
-        else " ".join(js["doc"].split())
-    )
+    nl = js["docstring"]
 
     nl_tokens, nl_ids = encode_text(
         nl,

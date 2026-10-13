@@ -39,6 +39,7 @@ Important:
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -1634,10 +1635,23 @@ def run_stage(
 
     else:
 
+        export_path = None
+        if (
+            args.test_data_file
+            and os.path.abspath(query_file)
+            == os.path.abspath(args.test_data_file)
+        ):
+            export_path = args.test_results_file or os.path.join(
+                args.output_dir,
+                "reranker_test_results.csv",
+            )
+
         result = evaluate_cached(
             args,
             mlp,
             *cache,
+            export_path=export_path,
+            tokenizer=tokenizer,
         )
 
         return result
@@ -1650,6 +1664,22 @@ def run_stage(
 # ============================================================
 
 @torch.no_grad()
+def _tokens_to_text(tokenizer, tokens):
+    """Convert stored token strings back to readable text."""
+    if not tokens:
+        return ""
+    special = {
+        getattr(tokenizer, "cls_token", None),
+        getattr(tokenizer, "sep_token", None),
+        "<encoder-only>",
+        getattr(tokenizer, "pad_token", None),
+    }
+    return tokenizer.convert_tokens_to_string(
+        [token for token in tokens if token not in special]
+    ).strip()
+
+
+@torch.no_grad()
 def evaluate_cached(
     args,
     mlp,
@@ -1657,6 +1687,8 @@ def evaluate_cached(
     code_dataset,
     topk_indices,
     cross_embeddings,
+    export_path=None,
+    tokenizer=None,
 ):
     """
     Evaluate using already cached cross-encoder embeddings.
@@ -1719,6 +1751,7 @@ def evaluate_cached(
 
     ranks = []
     topk_hits = []
+    rows = []
 
     for i, query_url in enumerate(
         query_urls
@@ -1767,6 +1800,89 @@ def evaluate_cached(
             float(hit)
         )
 
+        candidate_indices = [
+            int(index)
+            for index in topk_indices[i].tolist()
+        ]
+        candidate_scores = scores[i]
+        rerank_ranks = {
+            candidate_position: rerank_rank
+            for rerank_rank, candidate_position in enumerate(
+                order.tolist(),
+                start=1,
+            )
+        }
+        query_text = (
+            _tokens_to_text(
+                tokenizer,
+                getattr(query_dataset.examples[i], "nl_tokens", []),
+            )
+            if tokenizer
+            else ""
+        )
+        for original_rank, code_idx in enumerate(
+            candidate_indices,
+            start=1,
+        ):
+            example = code_dataset.examples[code_idx]
+            code_text = (
+                _tokens_to_text(
+                    tokenizer,
+                    getattr(example, "code_tokens", []),
+                )
+                if tokenizer
+                else ""
+            )
+            candidate_position = original_rank - 1
+            rows.append(
+                {
+                    "query_index": i,
+                    "query_url": query_url,
+                    "query": query_text,
+                    "codebase_index": code_idx,
+                    "code_url": code_urls[code_idx],
+                    "code": code_text,
+                    "dual_encoder_topk_rank": original_rank,
+                    "reranker_score": float(
+                        candidate_scores[candidate_position]
+                    ),
+                    "reranker_rank": rerank_ranks[candidate_position],
+                    "is_positive": int(code_urls[code_idx] == query_url),
+                }
+            )
+
+    if export_path:
+        os.makedirs(
+            os.path.dirname(os.path.abspath(export_path)),
+            exist_ok=True,
+        )
+        fields = [
+            "query_index",
+            "query_url",
+            "query",
+            "codebase_index",
+            "code_url",
+            "code",
+            "dual_encoder_topk_rank",
+            "reranker_score",
+            "reranker_rank",
+            "is_positive",
+        ]
+        with open(
+            export_path,
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(
+            "Exported %d query-code pairs to %s",
+            len(rows),
+            export_path,
+        )
+
     return {
         "mrr": float(
             np.mean(ranks)
@@ -1811,6 +1927,13 @@ def parse_args():
         "--codebase_file",
         type=str,
         default=None,
+    )
+
+    parser.add_argument(
+        "--test_results_file",
+        type=str,
+        default=None,
+        help="CSV path for query-code pairs sent to the reranker and their ranks.",
     )
 
     # --------------------------------------------------------
@@ -2028,6 +2151,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--frozen_layers",
+        default=None,
+        type=str,
+        help="Layers to freeze in the online encoder.",
+    )
+
+    parser.add_argument(
         "--num_workers",
         type=int,
         default=4,
@@ -2098,6 +2228,12 @@ def main():
     )
 
     args.n_gpu = torch.cuda.device_count()
+
+    args.frozen_layers = (
+            args.frozen_layers.split(",")
+            if args.frozen_layers is not None
+            else []
+        )
 
     logger.info(
         "device: %s, n_gpu: %d",

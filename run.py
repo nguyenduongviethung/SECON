@@ -159,7 +159,7 @@ def convert_examples_to_features(js,tokenizer,args):
     padding_length = args.code_length - len(code_ids)
     code_ids += [tokenizer.pad_token_id]*padding_length
     
-    nl = ' '.join(js['docstring_tokens']) if type(js['docstring_tokens']) is list else ' '.join(js['doc'].split())
+    nl = js['docstring']
     nl_tokens = tokenizer.tokenize(nl)[:args.nl_length-4]
     nl_tokens = [tokenizer.cls_token,"<encoder-only>",tokenizer.sep_token]+nl_tokens+[tokenizer.sep_token]
     nl_ids = tokenizer.convert_tokens_to_ids(nl_tokens)
