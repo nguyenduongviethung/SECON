@@ -351,11 +351,7 @@ def encode_text(text, tokenizer, max_length):
 
 def convert_examples_to_features(js, tokenizer, args):
     # Original code
-    code = (
-        " ".join(js["code_tokens"])
-        if isinstance(js["code_tokens"], list)
-        else " ".join(js["code_tokens"].split())
-    )
+    code = js["code"]
 
     code_tokens, code_ids = encode_text(
         code,
@@ -557,8 +553,9 @@ def train(args, model, cmodel, tokenizer):
                 loss_fn(code_vec, nl_vec, args)
                 + loss_fn(nl_vec, vec1, args)
                 + loss_fn(vec2, code_vec, args)
-                + covariance_loss(code_vec)
             )
+            if args.covariance_loss:
+                loss += covariance_loss(code_vec)
 
             tr_loss += loss.item()
             tr_num += 1
@@ -1007,6 +1004,12 @@ def main():
         default=2,
         type=int,
         help="Number of hardest negatives to consider in adaptive hard-negative loss.",
+    )
+
+    parser.add_argument(
+        "--covariance_loss",
+        action="store_true",
+        help="Whether to include covariance loss during training.",
     )
 
     parser.add_argument(
