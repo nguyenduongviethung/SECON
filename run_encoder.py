@@ -34,11 +34,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 class Model(nn.Module):
-    """
-    Online encoder.
-
-    This is the encoder used for retrieval/evaluation.
-    """
+    """Mean-pooled encoder used for online and momentum models."""
 
     def __init__(self, encoder, args):
         super().__init__()
@@ -50,7 +46,7 @@ class Model(nn.Module):
                     param.requires_grad = False
                     break
 
-    def _encode(self, inputs):
+    def forward(self, inputs):
         hidden = self.encoder(
             inputs,
             attention_mask=inputs.ne(1)
@@ -61,64 +57,6 @@ class Model(nn.Module):
         outputs = (hidden * mask).sum(1) / mask.sum(1).clamp_min(1.0)
 
         return F.normalize(outputs, p=2, dim=1)
-
-    def forward(self, code_inputs=None, nl_inputs=None):
-        if code_inputs is not None:
-            return self._encode(code_inputs)
-
-        return self._encode(nl_inputs)
-
-
-class CoModel(nn.Module):
-    """
-    Momentum encoder without PolyEncoder.
-
-    Removed:
-        - poly_code_embeddings
-        - dot_attention
-        - cross()
-
-    Kept:
-        - an independent encoder
-        - frozen gradients
-        - EMA/Momentum update from the online encoder in train()
-    """
-
-    def __init__(self, encoder, args):
-        super().__init__()
-        self.encoder = encoder
-
-        # Momentum encoder is not optimized by backpropagation.
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
-    def _encode(self, inputs):
-        hidden = self.encoder(
-            inputs,
-            attention_mask=inputs.ne(1)
-        )[0]
-
-        # No PolyEncoder and no attention:
-        # directly use mean-pooled encoder representation.
-        mask = inputs.ne(1).unsqueeze(-1).float()
-        outputs = (hidden * mask).sum(1) / mask.sum(1).clamp_min(1.0)
-
-        return F.normalize(outputs, p=2, dim=1)
-
-    @torch.no_grad()
-    def forward(self, code_inputs=None, nl_inputs=None):
-        if code_inputs is not None:
-            code_vec = self._encode(code_inputs)
-        else:
-            code_vec = None
-
-        if nl_inputs is not None:
-            nl_vec = self._encode(nl_inputs)
-        else:
-            nl_vec = None
-
-        return code_vec, nl_vec
-
 
 # ============================================================
 # Loss / utilities
@@ -325,12 +263,18 @@ class InputFeatures(object):
         nl_tokens,
         nl_ids,
         url,
+        summary=None,
+        summary_tokens=None,
+        summary_ids=None,
     ):
         self.code_tokens = code_tokens
         self.code_ids = code_ids
         self.nl_tokens = nl_tokens
         self.nl_ids = nl_ids
         self.url = url
+        self.summary = summary
+        self.summary_tokens = summary_tokens
+        self.summary_ids = summary_ids
 
 def encode_text(text, tokenizer, max_length):
     tokens = tokenizer.tokenize(text)[:max_length - 4]
@@ -368,18 +312,32 @@ def convert_examples_to_features(js, tokenizer, args):
         args.nl_length,
     )
 
+    summary = js.get("summary")
+    summary_tokens = None
+    summary_ids = None
+    if summary is not None:
+        summary_tokens, summary_ids = encode_text(
+            summary,
+            tokenizer,
+            args.nl_length,
+        )
+
     return InputFeatures(
         code_tokens,
         code_ids,
         nl_tokens,
         nl_ids,
         js["url"] if "url" in js else js["retrieval_idx"],
+        summary,
+        summary_tokens,
+        summary_ids,
     )
 
 
 class TextDataset(Dataset):
     def __init__(self, tokenizer, args, file_path):
-        self.args = args
+        self.pad_token_id = tokenizer.pad_token_id
+        self.nl_length = args.nl_length
         self.examples = []
 
         data = []
@@ -393,25 +351,10 @@ class TextDataset(Dataset):
 
                     js = json.loads(line)
 
-                    if "function_tokens" in js:
-                        js["code_tokens"] = js["function_tokens"]
-
                     data.append(js)
 
-            elif "codebase" in file_path or "code_idx_map" in file_path:
-                js = json.load(f)
-
-                for key in js:
-                    temp = {
-                        "code_tokens": key.split(),
-                        "retrieval_idx": js[key],
-                        "doc": "",
-                        "docstring_tokens": "",
-                    }
-                    data.append(temp)
-
             elif "json" in file_path:
-                data.extend(json.load(f))
+                data = json.load(f)
 
         for js in data:
             self.examples.append(
@@ -452,10 +395,15 @@ class TextDataset(Dataset):
 
     def __getitem__(self, i):
         example = self.examples[i]
+        summary_ids = example.summary_ids
+        if summary_ids is None:
+            summary_ids = [self.pad_token_id] * self.nl_length
 
         return (
             torch.tensor(example.code_ids),
             torch.tensor(example.nl_ids),
+            torch.tensor(summary_ids),
+            torch.tensor(example.summary_ids is not None),
         )
 
 
@@ -477,7 +425,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train(args, model, cmodel, tokenizer):
+def train(args, model, model2, tokenizer):
     train_file = args.train_data_file
 
     train_dataset = TextDataset(
@@ -518,12 +466,12 @@ def train(args, model, cmodel, tokenizer):
     )
 
     model.zero_grad()
-    cmodel.zero_grad()
+    model2.zero_grad()
 
     model.train()
 
     # Momentum encoder must not receive gradients.
-    cmodel.eval()
+    model2.eval()
 
     tr_num, tr_loss = 0, 0
     best_mrr = float("-inf")
@@ -538,13 +486,10 @@ def train(args, model, cmodel, tokenizer):
             code_inputs = batch[0].to(args.device)
             nl_inputs = batch[1].to(args.device)
 
-            code_vec = model(code_inputs=code_inputs)
-            nl_vec = model(nl_inputs=nl_inputs)
-
-            vec1, vec2 = cmodel(
-                code_inputs=code_inputs,
-                nl_inputs=nl_inputs,
-            )
+            code_vec = model(code_inputs)
+            nl_vec = model(nl_inputs)
+            vec1 = model2(code_inputs)
+            vec2 = model2(nl_inputs)
 
             # ------------------------------------------------
             # Same SECON loss structure
@@ -554,6 +499,24 @@ def train(args, model, cmodel, tokenizer):
                 + loss_fn(nl_vec, vec1, args)
                 + loss_fn(vec2, code_vec, args)
             )
+            if args.use_training_summary:
+                summary_inputs = batch[2].to(args.device)
+                summary_mask = batch[3].to(args.device).bool()
+                if summary_mask.any():
+                    summary_vec = model(summary_inputs)
+                    vec3 = model2(summary_inputs)
+                    loss += (
+                        loss_fn(
+                            nl_vec[summary_mask],
+                            summary_vec[summary_mask],
+                            args,
+                        )
+                        + loss_fn(
+                            nl_vec[summary_mask],
+                            vec3[summary_mask],
+                            args,
+                        )
+                    )
             if args.covariance_loss:
                 loss += covariance_loss(code_vec)
 
@@ -595,14 +558,14 @@ def train(args, model, cmodel, tokenizer):
                     model.module if hasattr(model, "module") else model
                 )
                 momentum_model = (
-                    cmodel.module if hasattr(cmodel, "module") else cmodel
+                    model2.module if hasattr(model2, "module") else model2
                 )
 
-                for p_model, p_cmodel in zip(
+                for p_model, p_model2 in zip(
                     online_model.parameters(),
                     momentum_model.parameters(),
                 ):
-                    p_cmodel.data.mul_(args.moco_m).add_(
+                    p_model2.data.mul_(args.moco_m).add_(
                         p_model.data,
                         alpha=1.0 - args.moco_m,
                     )
@@ -615,7 +578,6 @@ def train(args, model, cmodel, tokenizer):
             model,
             tokenizer,
             args.eval_data_file,
-            eval_when_training=True,
         )
 
         for key, value in results.items():
@@ -689,7 +651,6 @@ def evaluate(
     model,
     tokenizer,
     file_name,
-    eval_when_training=False,
     export_path=None,
 ):
     query_dataset = TextDataset(
@@ -730,28 +691,48 @@ def evaluate(
     model.eval()
 
     code_vecs = []
+    summary_vecs = []
+    code_has_summary = []
     nl_vecs = []
 
     for batch in query_dataloader:
         nl_inputs = batch[1].to(args.device)
 
         with torch.no_grad():
-            nl_vec = model(nl_inputs=nl_inputs)
+            nl_vec = model(nl_inputs)
             nl_vecs.append(nl_vec.cpu().numpy())
 
     for batch in code_dataloader:
         code_inputs = batch[0].to(args.device)
 
         with torch.no_grad():
-            code_vec = model(code_inputs=code_inputs)
+            code_vec = model(code_inputs)
             code_vecs.append(code_vec.cpu().numpy())
+            if args.use_testing_summary:
+                summary_inputs = batch[2].to(args.device)
+                summary_vec = model(summary_inputs)
+                summary_vecs.append(summary_vec.cpu().numpy())
+                code_has_summary.append(batch[3].numpy())
 
     model.train()
 
     code_vecs = np.concatenate(code_vecs, 0)
     nl_vecs = np.concatenate(nl_vecs, 0)
 
-    scores = np.matmul(nl_vecs, code_vecs.T)
+    code_scores = np.matmul(nl_vecs, code_vecs.T)
+    if args.use_testing_summary:
+        summary_scores = np.matmul(
+            nl_vecs,
+            np.concatenate(summary_vecs, 0).T,
+        )
+        summary_mask = np.concatenate(code_has_summary, 0).astype(bool)
+        scores = np.where(
+            summary_mask[None, :],
+            (code_scores + summary_scores) / 2,
+            code_scores,
+        )
+    else:
+        scores = code_scores
 
     sort_ids = np.argsort(
         scores,
@@ -823,6 +804,7 @@ def evaluate(
                         "codebase_index": code_idx,
                         "code_url": code_urls[code_idx],
                         "code": code_text,
+                        "summary": code_example.summary or "",
                         "dual_encoder_topk_rank": rank,
                         "dual_encoder_score": float(scores[query_index, code_idx]),
                         "is_positive": int(code_urls[code_idx] == query_url),
@@ -840,6 +822,7 @@ def evaluate(
             "codebase_index",
             "code_url",
             "code",
+            "summary",
             "dual_encoder_topk_rank",
             "dual_encoder_score",
             "is_positive",
@@ -935,6 +918,16 @@ def main():
         default=0.999,
         type=float,
         help="Momentum coefficient for the key encoder.",
+    )
+    parser.add_argument(
+        "--use_training_summary",
+        action="store_true",
+        help="Include code summaries in the training losses.",
+    )
+    parser.add_argument(
+        "--use_testing_summary",
+        action="store_true",
+        help="Include code summaries in evaluation and test scores.",
     )
 
     # Sequence lengths
@@ -1077,16 +1070,18 @@ def main():
         args.model_name_or_path
     )
 
-    model = RobertaModel.from_pretrained(
+    encoder = RobertaModel.from_pretrained(
         args.model_name_or_path
     )
 
-    model2 = RobertaModel.from_pretrained(
+    encoder2 = RobertaModel.from_pretrained(
         args.model_name_or_path
     )
 
-    model = Model(model, args)
-    cmodel = CoModel(model2, args)
+    model = Model(encoder, args)
+    model2 = Model(encoder2, args)
+    for param in model2.parameters():
+        param.requires_grad = False
 
     logger.info(
         "Training/evaluation parameters %s",
@@ -1094,18 +1089,18 @@ def main():
     )
 
     model.to(args.device)
-    cmodel.to(args.device)
+    model2.to(args.device)
 
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
-        cmodel = torch.nn.DataParallel(cmodel)
+        model2 = torch.nn.DataParallel(model2)
 
     # Training
     if args.do_train:
         train(
             args,
             model,
-            cmodel,
+            model2,
             tokenizer,
         )
 
