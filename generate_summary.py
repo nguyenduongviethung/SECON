@@ -606,6 +606,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--prompt",
+        type=str,
+        default=SUMMARY_PROMPT,
+    )
+
+    parser.add_argument(
         "--batch_size",
         type=int,
         default=8,
@@ -631,6 +637,8 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    SUMMARY_PROMPT = args.prompt
 
     # --------------------------------------------------------
     # GPU detection

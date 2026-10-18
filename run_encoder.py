@@ -726,12 +726,19 @@ def evaluate(
             np.concatenate(summary_vecs, 0).T,
         )
         summary_mask = np.concatenate(code_has_summary, 0).astype(bool)
+        weight_total = args.query_code_weight + args.query_summary_weight
+        combined_scores = (
+            args.query_code_weight * code_scores
+            + args.query_summary_weight * summary_scores
+        ) / weight_total
         scores = np.where(
             summary_mask[None, :],
-            (code_scores + summary_scores) / 2,
+            combined_scores,
             code_scores,
         )
     else:
+        summary_scores = None
+        summary_mask = None
         scores = code_scores
 
     sort_ids = np.argsort(
@@ -806,7 +813,17 @@ def evaluate(
                         "code": code_text,
                         "summary": code_example.summary or "",
                         "dual_encoder_topk_rank": rank,
-                        "dual_encoder_score": float(scores[query_index, code_idx]),
+                        "query_code_score": float(
+                            code_scores[query_index, code_idx]
+                        ),
+                        "query_summary_score": (
+                            float(summary_scores[query_index, code_idx])
+                            if summary_scores is not None
+                            and summary_mask is not None
+                            and summary_mask[code_idx]
+                            else ""
+                        ),
+                        "total_score": float(scores[query_index, code_idx]),
                         "is_positive": int(code_urls[code_idx] == query_url),
                     }
                 )
@@ -824,7 +841,9 @@ def evaluate(
             "code",
             "summary",
             "dual_encoder_topk_rank",
-            "dual_encoder_score",
+            "query_code_score",
+            "query_summary_score",
+            "total_score",
             "is_positive",
         ]
         with open(
@@ -928,6 +947,18 @@ def main():
         "--use_testing_summary",
         action="store_true",
         help="Include code summaries in evaluation and test scores.",
+    )
+    parser.add_argument(
+        "--query_code_weight",
+        default=0.5,
+        type=float,
+        help="Relative weight of the query-code score when summaries are used.",
+    )
+    parser.add_argument(
+        "--query_summary_weight",
+        default=0.5,
+        type=float,
+        help="Relative weight of the query-summary score when summaries are used.",
     )
 
     # Sequence lengths
@@ -1033,6 +1064,15 @@ def main():
 
     if args.do_test and args.topk <= 0:
         parser.error("--topk must be greater than 0")
+    score_weights = (args.query_code_weight, args.query_summary_weight)
+    if (
+        not all(np.isfinite(weight) and weight >= 0 for weight in score_weights)
+        or sum(score_weights) == 0
+    ):
+        parser.error(
+            "--query_code_weight and --query_summary_weight must be finite, "
+            "non-negative, and at least one must be greater than 0"
+        )
 
     print(json.dumps(vars(args), indent=4))
 
