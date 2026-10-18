@@ -129,6 +129,7 @@ def worker(
     batch_size,
     max_input_tokens,
     max_new_tokens,
+    summary_prompt,
     start,
     end,
 ):
@@ -220,7 +221,7 @@ def worker(
         # ----------------------------------------------------
 
         summary_prompts = [
-            SUMMARY_PROMPT.format(language=js["language"], code=js["code"])
+            summary_prompt.format(language=js["language"], code=js["code"])
             for js in batch
         ]
 
@@ -285,6 +286,7 @@ def run_generation(
     max_input_tokens,
     max_new_tokens,
     part,
+    summary_prompt,
     logger,
 ):
     """
@@ -399,6 +401,7 @@ def run_generation(
                 batch_size,
                 max_input_tokens,
                 max_new_tokens,
+                summary_prompt,
                 start,
                 end,
             ),
@@ -638,8 +641,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    SUMMARY_PROMPT = args.prompt
-
     # --------------------------------------------------------
     # GPU detection
     # --------------------------------------------------------
@@ -671,5 +672,6 @@ if __name__ == "__main__":
         max_input_tokens=args.max_input_tokens,
         max_new_tokens=args.max_new_tokens,
         part=args.part,
+        summary_prompt=args.prompt,
         logger=logger,
     )
