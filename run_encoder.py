@@ -256,25 +256,12 @@ def loss_fn(view1, view2, args):
 # ============================================================
 
 class InputFeatures(object):
-    def __init__(
-        self,
-        code_tokens,
-        code_ids,
-        nl_tokens,
-        nl_ids,
-        url,
-        summary=None,
-        summary_tokens=None,
-        summary_ids=None,
-    ):
+    def __init__(self, code_tokens, code_ids, nl_tokens, nl_ids, url):
         self.code_tokens = code_tokens
         self.code_ids = code_ids
         self.nl_tokens = nl_tokens
         self.nl_ids = nl_ids
         self.url = url
-        self.summary = summary
-        self.summary_tokens = summary_tokens
-        self.summary_ids = summary_ids
 
 def encode_text(text, tokenizer, max_length):
     tokens = tokenizer.tokenize(text)[:max_length - 4]
@@ -303,7 +290,6 @@ def convert_examples_to_features(js, tokenizer, args):
         args.code_length,
     )
 
-    # Tokenize the complete docstring rather than the pre-split summary tokens.
     nl = js["docstring"]
 
     nl_tokens, nl_ids = encode_text(
@@ -312,32 +298,17 @@ def convert_examples_to_features(js, tokenizer, args):
         args.nl_length,
     )
 
-    summary = js.get("summary")
-    summary_tokens = None
-    summary_ids = None
-    if summary is not None:
-        summary_tokens, summary_ids = encode_text(
-            summary,
-            tokenizer,
-            args.nl_length,
-        )
-
     return InputFeatures(
         code_tokens,
         code_ids,
         nl_tokens,
         nl_ids,
         js["url"] if "url" in js else js["retrieval_idx"],
-        summary,
-        summary_tokens,
-        summary_ids,
     )
 
 
 class TextDataset(Dataset):
     def __init__(self, tokenizer, args, file_path):
-        self.pad_token_id = tokenizer.pad_token_id
-        self.nl_length = args.nl_length
         self.examples = []
 
         data = []
@@ -395,15 +366,9 @@ class TextDataset(Dataset):
 
     def __getitem__(self, i):
         example = self.examples[i]
-        summary_ids = example.summary_ids
-        if summary_ids is None:
-            summary_ids = [self.pad_token_id] * self.nl_length
-
         return (
             torch.tensor(example.code_ids),
             torch.tensor(example.nl_ids),
-            torch.tensor(summary_ids),
-            torch.tensor(example.summary_ids is not None),
         )
 
 
@@ -499,24 +464,6 @@ def train(args, model, model2, tokenizer):
                 + loss_fn(nl_vec, vec1, args)
                 + loss_fn(vec2, code_vec, args)
             )
-            if args.use_training_summary:
-                summary_inputs = batch[2].to(args.device)
-                summary_mask = batch[3].to(args.device).bool()
-                if summary_mask.any():
-                    summary_vec = model(summary_inputs)
-                    vec3 = model2(summary_inputs)
-                    loss += (
-                        loss_fn(
-                            nl_vec[summary_mask],
-                            summary_vec[summary_mask],
-                            args,
-                        )
-                        + loss_fn(
-                            nl_vec[summary_mask],
-                            vec3[summary_mask],
-                            args,
-                        )
-                    )
             if args.covariance_loss:
                 loss += covariance_loss(code_vec)
 
@@ -691,8 +638,6 @@ def evaluate(
     model.eval()
 
     code_vecs = []
-    summary_vecs = []
-    code_has_summary = []
     nl_vecs = []
 
     for batch in query_dataloader:
@@ -708,11 +653,6 @@ def evaluate(
         with torch.no_grad():
             code_vec = model(code_inputs)
             code_vecs.append(code_vec.cpu().numpy())
-            if args.use_testing_summary:
-                summary_inputs = batch[2].to(args.device)
-                summary_vec = model(summary_inputs)
-                summary_vecs.append(summary_vec.cpu().numpy())
-                code_has_summary.append(batch[3].numpy())
 
     model.train()
 
@@ -720,26 +660,7 @@ def evaluate(
     nl_vecs = np.concatenate(nl_vecs, 0)
 
     code_scores = np.matmul(nl_vecs, code_vecs.T)
-    if args.use_testing_summary:
-        summary_scores = np.matmul(
-            nl_vecs,
-            np.concatenate(summary_vecs, 0).T,
-        )
-        summary_mask = np.concatenate(code_has_summary, 0).astype(bool)
-        weight_total = args.query_code_weight + args.query_summary_weight
-        combined_scores = (
-            args.query_code_weight * code_scores
-            + args.query_summary_weight * summary_scores
-        ) / weight_total
-        scores = np.where(
-            summary_mask[None, :],
-            combined_scores,
-            code_scores,
-        )
-    else:
-        summary_scores = None
-        summary_mask = None
-        scores = code_scores
+    scores = code_scores
 
     sort_ids = np.argsort(
         scores,
@@ -811,17 +732,9 @@ def evaluate(
                         "codebase_index": code_idx,
                         "code_url": code_urls[code_idx],
                         "code": code_text,
-                        "summary": code_example.summary or "",
                         "dual_encoder_topk_rank": rank,
                         "query_code_score": float(
                             code_scores[query_index, code_idx]
-                        ),
-                        "query_summary_score": (
-                            float(summary_scores[query_index, code_idx])
-                            if summary_scores is not None
-                            and summary_mask is not None
-                            and summary_mask[code_idx]
-                            else ""
                         ),
                         "total_score": float(scores[query_index, code_idx]),
                         "is_positive": int(code_urls[code_idx] == query_url),
@@ -839,10 +752,8 @@ def evaluate(
             "codebase_index",
             "code_url",
             "code",
-            "summary",
             "dual_encoder_topk_rank",
             "query_code_score",
-            "query_summary_score",
             "total_score",
             "is_positive",
         ]
@@ -938,29 +849,6 @@ def main():
         type=float,
         help="Momentum coefficient for the key encoder.",
     )
-    parser.add_argument(
-        "--use_training_summary",
-        action="store_true",
-        help="Include code summaries in the training losses.",
-    )
-    parser.add_argument(
-        "--use_testing_summary",
-        action="store_true",
-        help="Include code summaries in evaluation and test scores.",
-    )
-    parser.add_argument(
-        "--query_code_weight",
-        default=0.5,
-        type=float,
-        help="Relative weight of the query-code score when summaries are used.",
-    )
-    parser.add_argument(
-        "--query_summary_weight",
-        default=0.5,
-        type=float,
-        help="Relative weight of the query-summary score when summaries are used.",
-    )
-
     # Sequence lengths
     parser.add_argument(
         "--nl_length",
@@ -1064,15 +952,6 @@ def main():
 
     if args.do_test and args.topk <= 0:
         parser.error("--topk must be greater than 0")
-    score_weights = (args.query_code_weight, args.query_summary_weight)
-    if (
-        not all(np.isfinite(weight) and weight >= 0 for weight in score_weights)
-        or sum(score_weights) == 0
-    ):
-        parser.error(
-            "--query_code_weight and --query_summary_weight must be finite, "
-            "non-negative, and at least one must be greater than 0"
-        )
 
     print(json.dumps(vars(args), indent=4))
 
