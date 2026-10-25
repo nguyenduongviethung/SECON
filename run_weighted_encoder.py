@@ -318,7 +318,12 @@ def main():
         description="Evaluate weighted query-code and query-summary scores."
     )
     parser.add_argument("--code_model_path", required=True, type=str)
-    parser.add_argument("--summary_model_path", required=True, type=str)
+    parser.add_argument(
+        "--summary_model_path",
+        default=None,
+        type=str,
+        help="Defaults to --code_model_path when omitted.",
+    )
     parser.add_argument("--eval_data_file", required=True, type=str)
     parser.add_argument("--codebase_file", required=True, type=str)
     parser.add_argument("--output_file", default=None, type=str)
@@ -330,6 +335,8 @@ def main():
     parser.add_argument("--query_code_weight", default=0.5, type=float)
     parser.add_argument("--query_summary_weight", default=0.5, type=float)
     args = parser.parse_args()
+    if args.summary_model_path is None:
+        args.summary_model_path = args.code_model_path
 
     weights = (args.query_code_weight, args.query_summary_weight)
     if (
