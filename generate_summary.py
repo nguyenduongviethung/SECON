@@ -209,61 +209,24 @@ def build_neighbors_block(data, neighbor_indices):
         )
     return "\n\n".join(parts)
 
-import re
-
-_BOILERPLATE_OPENERS = [
-    r"^(The|This)\s+(primary\s+)?purpose\s+of\s+(the\s+)?(provided\s+|given\s+)?code\s+.*?\s+is\s+(to|designed\s+to)\s+",
-    r"^The\s+`?\w+`?\s+(method|function|code)\s+.*?\s+(is\s+)?(designed\s+to|is\s+responsible\s+for)\s+",
-    r"^The\s+code\s+(defines|is|does)\s+",
-    r"^Here\s+is\s+",
-    r"^Summary:",
-]
-
-_CODE_LINE = re.compile(
-    r"^(FileUtils\.|def\s|end\b|\}\s*$|\)\s*$|\]\s*$|if\s|elsif\s|else\b|"
-    r"return\s|#\s|puts\s|shellout|File\.|Dir\.|log\.|raise\s)"
-)
-
-
-def sanitize_summary(text):
-    text = text.strip()
-
-    # 1. Cắt mọi thứ từ tag/format cũ trở đi
-    text = re.split(r"</?similar_code_\d+[^>]*>", text, maxsplit=1)[0].strip()
-    text = re.split(r"\[N\d+\]", text, maxsplit=1)[0].strip()
-
-    # 2. Cắt khi gặp dòng giống code
-    kept = []
-    for line in text.split("\n"):
-        if _CODE_LINE.match(line.strip()):
-            break
-        if line.strip():
-            kept.append(line)
-    text = "\n".join(kept).strip()
-
-    # 3. Bỏ boilerplate mở bài
-    for pat in _BOILERPLATE_OPENERS:
-        new = re.sub(pat, "", text, count=1, flags=re.IGNORECASE).strip()
-        if new:
-            text = new
-            break
-
-    # 4. Chuẩn hoá dấu câu
-    if text and text[0].islower():
-        text = text[0].upper() + text[1:]
-    if text and text[-1] not in ".!?":
-        text += "."
-
-    return text
-
-
-def is_summary_valid(text, min_chars=40, max_chars=400):
-    if len(text) < min_chars or len(text) > max_chars:
-        return False
-    if len(re.findall(r"[{};=]", text)) > 3:  # quá nhiều cú pháp code
-        return False
-    return True
-
+def extract_summary(text, min_len=40):
+    """Summary là paragraph viết liền (không có \\n bên trong).
+    Leak/tag luôn ngắn (<25 ký tự). Duyệt từ dưới lên, gặp dòng
+    đủ dài đầu tiên thì lấy luôn làm summary, bỏ toàn bộ phía trên.
+    """
+    if not text:
+        return ""
+    for raw_line in reversed(text.split("\n")):
+        s = " ".join(raw_line.split())
+        if len(s) < min_len:
+            continue
+        # Chuẩn hoá nhẹ cho giống docstring
+        if s[0].islower():
+            s = s[0].upper() + s[1:]
+        if s[-1] not in ".!?":
+            s += "."
+        return s
+    return ""
 
 # ============================================================
 # Worker
@@ -283,8 +246,8 @@ def worker(
     start,
     end,
 ):
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True) # type: ignore
+    sys.stderr.reconfigure(line_buffering=True) # type: ignore
 
     logging.basicConfig(
         level=logging.INFO,
@@ -350,14 +313,7 @@ def worker(
         )
 
         for i, (js, generated_summary) in enumerate(zip(batch, generated_summaries)):
-            cleaned = sanitize_summary(generated_summary)
-
-            if not is_summary_valid(cleaned):
-                # fallback: dùng docstring gốc — thà yếu còn hơn rác
-                fallback = sanitize_summary(
-                    (data[start + batch_start + i].get("docstring") or "")[:400]
-                )
-                cleaned = fallback if fallback else cleaned
+            cleaned = extract_summary(generated_summary)
 
             result = dict(js)
             result["summary"] = cleaned
