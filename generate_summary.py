@@ -187,11 +187,27 @@ def get_part_range(total, part_idx, part_total):
     return start, end
 
 
-def build_neighbors_block(nbr_codes):
-    """Render block [N1]..[Nk] cho SUMMARY_PROMPT_NEIGHBORS."""
-    return "\n\n".join(
-        f"[N{j + 1}]\n{c}" for j, c in enumerate(nbr_codes)
-    )
+def _trim_neighbor_code(code, max_lines=25):
+    """Slice code to a maximum number of lines, trying to end at a logical boundary."""
+    lines = code.split("\n")
+    if len(lines) <= max_lines:
+        return code
+    for i in range(max_lines, max(8, max_lines // 2), -1):
+        if lines[i - 1].strip() in ("end", "}", "end)", "end,"):
+            return "\n".join(lines[:i])
+    return "\n".join(lines[:max_lines])
+
+
+def build_neighbors_block(data, neighbor_indices):
+    parts = []
+    for j, nidx in enumerate(neighbor_indices):
+        neighbor_code = _trim_neighbor_code(data[nidx]["code"])
+        parts.append(
+            f'<similar_code_{j+1} note="reference only; do not copy or describe">\n'
+            f"{neighbor_code}\n"
+            f"</similar_code_{j+1}>"
+        )
+    return "\n\n".join(parts)
 
 
 # ============================================================
@@ -257,16 +273,18 @@ def worker(
 
             if encoder_neighbors is not None:
                 nbr_idxs = encoder_neighbors[global_idx][:num_neighbors]
-                nbr_codes = [data[nidx]["code"] for nidx in nbr_idxs]
+                neighbors_text = build_neighbors_block(data, nbr_idxs)
+                n_neighbors = len(nbr_idxs)
             else:
-                nbr_codes = []
+                neighbors_text = ""
+                n_neighbors = 0
 
             summary_prompts.append(
                 summary_prompt.format(
-                    language=js["language"],
-                    code=js["code"],
-                    n_neighbors=len(nbr_codes),
-                    neighbors=build_neighbors_block(nbr_codes),
+                    language=js.get("language", "unknown"),
+                    code=js.get("code", ""),
+                    n_neighbors=n_neighbors,
+                    neighbors=neighbors_text,
                 )
             )
 
