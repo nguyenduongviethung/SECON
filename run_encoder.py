@@ -965,9 +965,6 @@ def main():
     if args.do_test and args.topk <= 0:
         parser.error("--topk must be greater than 0")
 
-    if args.do_eval_train and not args.do_train:
-        parser.error("--do_eval_train requires --do_train")
-
     print(json.dumps(vars(args), indent=4))
 
     logging.basicConfig(
@@ -1040,7 +1037,7 @@ def main():
 
     # Evaluate on the training set only after the training loop has finished.
     if args.do_eval_train:
-        if args.do_zero_shot is False:
+        if args.do_train and args.do_zero_shot is False:
             load_best_encoder(
                 args,
                 model,
