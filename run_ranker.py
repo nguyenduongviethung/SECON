@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from transformers import get_linear_schedule_with_warmup
@@ -657,7 +658,9 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    accelerator = Accelerator()
+    # Base encoders may contain parameters, such as a pooler, unused by embeddings.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     print(json.dumps(vars(args), indent=4))
 
     device = accelerator.device
