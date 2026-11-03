@@ -599,6 +599,7 @@ def evaluate(
     tokenizer,
     file_name,
     export_path=None,
+    code_file_name=None,
 ):
     query_dataset = TextDataset(
         tokenizer,
@@ -618,7 +619,7 @@ def evaluate(
     code_dataset = TextDataset(
         tokenizer,
         args,
-        args.codebase_file,
+        code_file_name or args.codebase_file,
     )
 
     code_sampler = SequentialSampler(code_dataset)
@@ -1054,6 +1055,7 @@ def main():
                 args.output_dir,
                 "dual_encoder_train_eval_results.csv",
             ),
+            code_file_name=args.train_data_file,
         )
 
         logger.info("***** Train Eval results *****")
