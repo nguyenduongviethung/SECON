@@ -828,6 +828,13 @@ def main():
         help="CSV path for the top-k dual-encoder results.",
     )
 
+    parser.add_argument(
+        "--train_eval_results_file",
+        default=None,
+        type=str,
+        help="CSV path for the top-k train-evaluation results.",
+    )
+
     # Model
     parser.add_argument(
         "--model_name_or_path",
@@ -872,6 +879,11 @@ def main():
     # Modes
     parser.add_argument("--do_train", action="store_true")
     parser.add_argument("--do_eval", action="store_true")
+    parser.add_argument(
+        "--do_eval_train",
+        action="store_true",
+        help="Evaluate on the training data after training is complete.",
+    )
     parser.add_argument("--do_test", action="store_true")
     parser.add_argument("--do_zero_shot", action="store_true")
     parser.add_argument("--do_F2_norm", action="store_true")
@@ -953,6 +965,9 @@ def main():
     if args.do_test and args.topk <= 0:
         parser.error("--topk must be greater than 0")
 
+    if args.do_eval_train and not args.do_train:
+        parser.error("--do_eval_train requires --do_train")
+
     print(json.dumps(vars(args), indent=4))
 
     logging.basicConfig(
@@ -1022,6 +1037,36 @@ def main():
             model2,
             tokenizer,
         )
+
+    # Evaluate on the training set only after the training loop has finished.
+    if args.do_eval_train:
+        if args.do_zero_shot is False:
+            load_best_encoder(
+                args,
+                model,
+            )
+
+        model.to(args.device)
+
+        result = evaluate(
+            args,
+            model,
+            tokenizer,
+            args.train_data_file,
+            export_path=args.train_eval_results_file or os.path.join(
+                args.output_dir,
+                "dual_encoder_train_eval_results.csv",
+            ),
+        )
+
+        logger.info("***** Train Eval results *****")
+
+        for key in sorted(result.keys()):
+            logger.info(
+                "  %s = %s",
+                key,
+                str(round(result[key], 3)),
+            )
 
     # Evaluation
     if args.do_eval:
