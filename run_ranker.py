@@ -8,8 +8,8 @@ Score = semantic_weight * cos(query, semantic_code)
 - query_model      : SentenceTransformer, encodes natural language
 - semantic_model   : SentenceTransformer, encodes code (semantic view)
 - functional_model : SentenceTransformer on GraphCodeBERT, encodes code (functional view)
-- No custom nn.Module wrapping: we call SentenceTransformer.encode during eval.
-- For training we call tokenize + forward directly (encode uses torch.no_grad).
+- Accelerate uses one process per GPU and DDP to synchronize encoder gradients.
+- For training we tokenize directly and call forward (encode uses torch.no_grad).
 - Only InfoNCE and adaptive hard-negative losses are kept.
 - GraphCodeBERT parser is imported from repo root (no path argument needed).
 """
@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from transformers import get_linear_schedule_with_warmup
@@ -181,12 +182,15 @@ class TextDataset(Dataset):
 # Model loading / encoding helpers
 # ============================================================
 
-def load_embedding_model(model_name_or_path, max_seq_length, trust_remote_code):
+def load_embedding_model(
+    model_name_or_path, max_seq_length, trust_remote_code, device=None
+):
     """Load a SentenceTransformer, falling back to Transformer + MeanPooling."""
     try:
         st = SentenceTransformer(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
+            device=device,
         )
     except Exception as e:
         logger.info(
@@ -201,7 +205,7 @@ def load_embedding_model(model_name_or_path, max_seq_length, trust_remote_code):
         )
         dim = transformer.get_word_embedding_dimension()
         pooling = Pooling(dim, pooling_mode_mean_tokens=True)
-        st = SentenceTransformer(modules=[transformer, pooling])
+        st = SentenceTransformer(modules=[transformer, pooling], device=device)
 
     st.max_seq_length = max_seq_length
     return st
@@ -231,23 +235,23 @@ def encode_text(model, texts, device, batch_size=32, show_progress=False):
     return emb
 
 
-def encode_for_training(model, texts, device):
+def encode_for_training(model, texts, device, accelerator):
     """Encode texts with gradients flowing through `model`.
 
     SentenceTransformer.encode() runs under torch.no_grad(), so we call
     tokenize() + forward() directly.  The forward pass goes through the
     same modules (Transformer, Pooling, ...) as encode().
     """
-    first = model[0]
+    first = accelerator.unwrap_model(model)[0]
     features = first.tokenize(texts)
     features = {
         k: (v.to(device) if isinstance(v, torch.Tensor) else v)
         for k, v in features.items()
     }
-    emb = model.forward(features)
+    emb = model(features)
     if isinstance(emb, dict):
         emb = emb.get("sentence_embedding", list(emb.values())[-1])
-    return F.normalize(emb, p=2, dim=1)
+    return F.normalize(emb.float(), p=2, dim=1)
 
 
 # ============================================================
@@ -271,9 +275,15 @@ def save_best_models(args, query_model, semantic_model, functional_model):
 
 def load_best_models(args):
     base = best_checkpoint_dir(args)
-    q = SentenceTransformer(os.path.join(base, "query_model"))
-    s = SentenceTransformer(os.path.join(base, "semantic_model"))
-    f = SentenceTransformer(os.path.join(base, "functional_model"))
+    q = SentenceTransformer(
+        os.path.join(base, "query_model"), device=args.device
+    )
+    s = SentenceTransformer(
+        os.path.join(base, "semantic_model"), device=args.device
+    )
+    f = SentenceTransformer(
+        os.path.join(base, "functional_model"), device=args.device
+    )
 
     q.max_seq_length = args.nl_length
     s.max_seq_length = args.code_length
@@ -302,7 +312,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train(args, query_model, semantic_model, functional_model):
+def train(args, query_model, semantic_model, functional_model, accelerator):
     train_dataset = TextDataset(
         args.train_data_file,
         use_parser_preprocessing=args.use_parser_preprocessing,
@@ -328,13 +338,36 @@ def train(args, query_model, semantic_model, functional_model):
         num_warmup_steps=0,
         num_training_steps=len(train_dataloader) * args.num_train_epochs,
     )
+    (
+        query_model,
+        semantic_model,
+        functional_model,
+        optimizer,
+        train_dataloader,
+        scheduler,
+    ) = accelerator.prepare(
+        query_model,
+        semantic_model,
+        functional_model,
+        optimizer,
+        train_dataloader,
+        scheduler,
+    )
+    params = (
+        list(query_model.parameters())
+        + list(semantic_model.parameters())
+        + list(functional_model.parameters())
+    )
 
-    logger.info("***** Running ranker training *****")
-    logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Batch size = %d", args.train_batch_size)
-    logger.info("  Total steps = %d",
-                len(train_dataloader) * args.num_train_epochs)
+    if accelerator.is_main_process:
+        logger.info("***** Running ranker training *****")
+        logger.info("  Num examples = %d", len(train_dataset))
+        logger.info("  Num Epochs = %d", args.num_train_epochs)
+        logger.info("  Batch size per process = %d", args.train_batch_size)
+        logger.info(
+            "  Total steps per process = %d",
+            len(train_dataloader) * args.num_train_epochs,
+        )
 
     best_mrr = float("-inf")
 
@@ -349,48 +382,73 @@ def train(args, query_model, semantic_model, functional_model):
             code_texts = batch["code"]
             nl_texts = batch["nl"]
 
-            q = encode_for_training(query_model, nl_texts, args.device)
-            s = encode_for_training(semantic_model, code_texts, args.device)
-            f = encode_for_training(functional_model, code_texts, args.device)
+            with accelerator.autocast():
+                q = encode_for_training(
+                    query_model, nl_texts, args.device, accelerator
+                )
+                s = encode_for_training(
+                    semantic_model, code_texts, args.device, accelerator
+                )
+                f = encode_for_training(
+                    functional_model, code_texts, args.device, accelerator
+                )
 
             loss = ranker_loss(q, s, f, args)
 
             tr_loss += loss.item()
             tr_num += 1
-            if (step + 1) % 100 == 0:
+            if accelerator.is_main_process and (step + 1) % 100 == 0:
                 logger.info(
                     "epoch %d step %d loss %.5f",
                     epoch, step + 1, tr_loss / tr_num,
                 )
                 tr_loss, tr_num = 0.0, 0
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(params, args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
 
         # ---- end of epoch evaluation ----
         if not args.eval_data_file:
-            logger.warning("No --eval_data_file set; skipping per-epoch eval.")
+            if accelerator.is_main_process:
+                logger.warning("No --eval_data_file set; skipping per-epoch eval.")
             continue
 
-        results = evaluate(
-            args, query_model, semantic_model, functional_model,
-            args.eval_data_file,
-        )
-        for k, v in results.items():
-            logger.info("  %s = %s", k, round(v, 4))
-
-        if results["eval_mrr"] > best_mrr:
-            best_mrr = results["eval_mrr"]
-            logger.info("********************")
-            logger.info("New best MRR: %s", round(best_mrr, 4))
-            logger.info("********************")
-            save_best_models(
-                args, query_model, semantic_model, functional_model,
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            results = evaluate(
+                args,
+                accelerator.unwrap_model(query_model),
+                accelerator.unwrap_model(semantic_model),
+                accelerator.unwrap_model(functional_model),
+                args.eval_data_file,
             )
+            for k, v in results.items():
+                logger.info("  %s = %s", k, round(v, 4))
 
+            if results["eval_mrr"] > best_mrr:
+                best_mrr = results["eval_mrr"]
+                logger.info("********************")
+                logger.info("New best MRR: %s", round(best_mrr, 4))
+                logger.info("********************")
+                save_best_models(
+                    args,
+                    accelerator.unwrap_model(query_model),
+                    accelerator.unwrap_model(semantic_model),
+                    accelerator.unwrap_model(functional_model),
+                )
+        accelerator.wait_for_everyone()
+
+    accelerator.free_memory(
+        query_model,
+        semantic_model,
+        functional_model,
+        optimizer,
+        train_dataloader,
+        scheduler,
+    )
 
 # ============================================================
 # Evaluation / test
@@ -599,57 +657,88 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+    accelerator = Accelerator()
     print(json.dumps(vars(args), indent=4))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = accelerator.device
     args.n_gpu = torch.cuda.device_count()
     args.device = device
-    logger.info("device: %s, n_gpu: %s", device, args.n_gpu)
+    logger.info(
+        "device: %s, n_gpu: %s, process: %s/%s",
+        device,
+        args.n_gpu,
+        accelerator.process_index,
+        accelerator.num_processes,
+    )
 
     set_seed(args.seed)
 
     # ---------------- Build models ----------------
-    query_model = load_embedding_model(
-        args.query_model,
-        args.nl_length,
-        args.query_trust_remote_code,
-    )
-    semantic_model = load_embedding_model(
-        args.semantic_model,
-        args.code_length,
-        args.semantic_trust_remote_code,
-    )
-    functional_model = load_embedding_model(
-        args.functional_model,
-        args.code_length,
-        args.functional_trust_remote_code,
-    )
+    query_model = semantic_model = functional_model = None
+    if args.do_train or args.do_zero_shot:
+        query_model = load_embedding_model(
+            args.query_model,
+            args.nl_length,
+            args.query_trust_remote_code,
+            device=args.device,
+        )
+        semantic_model = load_embedding_model(
+            args.semantic_model,
+            args.code_length,
+            args.semantic_trust_remote_code,
+            device=args.device,
+        )
+        functional_model = load_embedding_model(
+            args.functional_model,
+            args.code_length,
+            args.functional_trust_remote_code,
+            device=args.device,
+        )
 
-    query_model.to(args.device)
-    semantic_model.to(args.device)
-    functional_model.to(args.device)
+        query_model.to(args.device)
+        semantic_model.to(args.device)
+        functional_model.to(args.device)
 
     # ---------------- Train ----------------
     if args.do_train:
-        train(args, query_model, semantic_model, functional_model)
+        train(args, query_model, semantic_model, functional_model, accelerator)
+
+    models_loaded_from_checkpoint = False
+    if args.do_train and not args.do_zero_shot and (args.do_eval or args.do_test):
+        query_model = semantic_model = functional_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ---------------- Eval ----------------
     if args.do_eval:
-        if not args.do_zero_shot:
-            query_model, semantic_model, functional_model = load_best_models(args)
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            if not args.do_zero_shot:
+                query_model, semantic_model, functional_model = load_best_models(args)
+                models_loaded_from_checkpoint = True
+            else:
+                query_model = accelerator.unwrap_model(query_model)
+                semantic_model = accelerator.unwrap_model(semantic_model)
+                functional_model = accelerator.unwrap_model(functional_model)
 
-        result = evaluate(
-            args, query_model, semantic_model, functional_model,
-            args.eval_data_file,
-        )
-        logger.info("***** Eval results *****")
-        for k in sorted(result.keys()):
-            logger.info("  %s = %s", k, round(result[k], 4))
+            result = evaluate(
+                args, query_model, semantic_model, functional_model,
+                args.eval_data_file,
+            )
+            logger.info("***** Eval results *****")
+            for k in sorted(result.keys()):
+                logger.info("  %s = %s", k, round(result[k], 4))
+        accelerator.wait_for_everyone()
 
     # ---------------- Test ----------------
     if args.do_test:
+        accelerator.wait_for_everyone()
+        if not accelerator.is_main_process:
+            return
+
         if not args.do_zero_shot:
-            query_model, semantic_model, functional_model = load_best_models(args)
+            if not models_loaded_from_checkpoint:
+                query_model, semantic_model, functional_model = load_best_models(args)
 
         export_path = args.test_results_file or os.path.join(
             args.output_dir, "ranker_test_results.csv"
